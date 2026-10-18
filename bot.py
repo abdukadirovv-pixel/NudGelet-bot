@@ -2067,19 +2067,22 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Launch Nudgelet & Main Menu"),
-            BotCommand(command="remind", description="Quick reminder (e.g. /remind 15m Tea)"),
-            BotCommand(command="list", description="Open Reminders Dashboard"),
-            BotCommand(command="note", description="Save a quick Note, Voice, or File"),
-            BotCommand(command="notes", description="Open Multimedia Notebook"),
-            BotCommand(command="search", description="Search reminders & notes"),
-            BotCommand(command="stats", description="Productivity streak & stats"),
-            BotCommand(command="settings", description="Timezone, DND & Auto-Pin"),
-            BotCommand(command="help", description="Full command guide"),
-        ]
-    )
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Launch Nudgelet & Main Menu"),
+                BotCommand(command="remind", description="Quick reminder (e.g. /remind 15m Tea)"),
+                BotCommand(command="list", description="Open Reminders Dashboard"),
+                BotCommand(command="note", description="Save a quick Note, Voice, or File"),
+                BotCommand(command="notes", description="Open Multimedia Notebook"),
+                BotCommand(command="search", description="Search reminders & notes"),
+                BotCommand(command="stats", description="Productivity streak & stats"),
+                BotCommand(command="settings", description="Timezone, DND & Auto-Pin"),
+                BotCommand(command="help", description="Full command guide"),
+            ]
+        )
+    except Exception as e:
+        logger.warning(f"Could not set bot commands: {e}")
 
     await start_health_server()
     asyncio.create_task(scheduler_engine(bot))
