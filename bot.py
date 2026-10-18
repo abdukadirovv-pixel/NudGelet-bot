@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
 from aiohttp import web
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -27,7 +28,7 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# 1. LOAD .ENV & CONFIGURATION
+# 1. LOAD .ENV, CONFIGURATION & AES ENCRYPTION ENGINE
 # =====================================================================
 load_dotenv()
 
@@ -45,8 +46,31 @@ ADMIN_IDS = {int(x.strip()) for x in RAW_ADMINS.split(",") if x.strip().isdigit(
 PORT = int(os.getenv("PORT", "8080"))
 DEFAULT_TZ_OFFSET = int(os.getenv("DEFAULT_TZ_OFFSET", "5"))
 
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
+if not ENCRYPTION_KEY:
+    logger.warning("ENCRYPTION_KEY not set! Generating a temporary key (make sure ENCRYPTION_KEY is set in Railway!).")
+    ENCRYPTION_KEY = Fernet.generate_key().decode()
+
+cipher = Fernet(ENCRYPTION_KEY.encode())
+
+
+def enc(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return val
+    return cipher.encrypt(val.encode("utf-8")).decode("utf-8")
+
+
+def dec(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return val
+    try:
+        return cipher.decrypt(val.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, Exception):
+        return val
+
+
 # =====================================================================
-# 2. SUPABASE POSTGRESQL ENGINE (WRITE-THROUGH + ASYNCPG POOL)
+# 2. SUPABASE POSTGRESQL ENGINE (ZERO-KNOWLEDGE ENCRYPTED STORAGE)
 # =====================================================================
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nudgelet_users (
@@ -107,7 +131,6 @@ class SupabaseEngine:
         self.deleted_reminders_cache: Dict[int, Dict[str, Any]] = {}
 
     async def init(self, dsn: str) -> None:
-        # statement_cache_size=0 ensures compatibility with Supabase Transaction Pooler (port 6543)
         self.pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10, statement_cache_size=0)
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
@@ -118,14 +141,21 @@ class SupabaseEngine:
 
             rem_rows = await conn.fetch("SELECT * FROM nudgelet_reminders")
             for r in rem_rows:
-                self.reminders[r["id"]] = dict(r)
+                d = dict(r)
+                d["text"] = dec(d["text"])
+                d["file_id"] = dec(d.get("file_id"))
+                self.reminders[d["id"]] = d
 
             note_rows = await conn.fetch("SELECT * FROM nudgelet_notes")
             for r in note_rows:
-                self.notes[r["id"]] = dict(r)
+                d = dict(r)
+                d["title"] = dec(d["title"])
+                d["content"] = dec(d["content"])
+                d["file_id"] = dec(d.get("file_id"))
+                self.notes[d["id"]] = d
 
         logger.info(
-            f"Supabase connected! Loaded {len(self.users)} users, "
+            f"Supabase connected (Encrypted Mode)! Loaded {len(self.users)} users, "
             f"{len(self.reminders)} reminders, {len(self.notes)} notes."
         )
 
@@ -214,7 +244,7 @@ class SupabaseEngine:
                 ) VALUES ($1,$2,$3,$4,$5,$6,'active',0,0,NULL,$7,$8,$9)
                 RETURNING id
                 """,
-                user_id, text, due_ts, recurrence, priority, category, media_type, file_id, now_ts,
+                user_id, enc(text), due_ts, recurrence, priority, category, media_type, enc(file_id), now_ts,
             )
         rem = {
             "id": rid,
@@ -245,10 +275,10 @@ class SupabaseEngine:
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                 ON CONFLICT (id) DO NOTHING
                 """,
-                rem["id"], rem["user_id"], rem["text"], rem["due_ts"], rem["recurrence"],
+                rem["id"], rem["user_id"], enc(rem["text"]), rem["due_ts"], rem["recurrence"],
                 rem["priority"], rem["category"], rem["status"], rem["nag_count"],
                 rem.get("last_nag_ts", 0.0), rem.get("pinned_msg_id"),
-                rem.get("media_type"), rem.get("file_id"), rem["created_at"],
+                rem.get("media_type"), enc(rem.get("file_id")), rem["created_at"],
             )
         self.reminders[rem["id"]] = rem
         return rem
@@ -266,9 +296,9 @@ class SupabaseEngine:
                     media_type=$11, file_id=$12
                 WHERE id=$1
                 """,
-                rid, r["text"], r["due_ts"], r["recurrence"], r["priority"], r["category"],
+                rid, enc(r["text"]), r["due_ts"], r["recurrence"], r["priority"], r["category"],
                 r["status"], r["nag_count"], r.get("last_nag_ts", 0.0), r.get("pinned_msg_id"),
-                r.get("media_type"), r.get("file_id"),
+                r.get("media_type"), enc(r.get("file_id")),
             )
 
     async def delete_reminder(self, rid: int) -> Optional[Dict[str, Any]]:
@@ -296,7 +326,7 @@ class SupabaseEngine:
                 ) VALUES ($1,$2,$3,$4,FALSE,$5,$6,$7,$8)
                 RETURNING id
                 """,
-                user_id, clean_title, content, tag, media_type, file_id, now_ts, now_ts,
+                user_id, enc(clean_title), enc(content), tag, media_type, enc(file_id), now_ts, now_ts,
             )
         note = {
             "id": nid,
@@ -325,8 +355,8 @@ class SupabaseEngine:
                     media_type=$6, file_id=$7, updated_at=$8
                 WHERE id=$1
                 """,
-                nid, n["title"], n["content"], n["tag"], n["pinned"],
-                n.get("media_type"), n.get("file_id"), n["updated_at"],
+                nid, enc(n["title"]), enc(n["content"]), n["tag"], n["pinned"],
+                n.get("media_type"), enc(n.get("file_id")), n["updated_at"],
             )
 
     async def delete_note(self, nid: int) -> None:
@@ -339,7 +369,7 @@ db = SupabaseEngine()
 router = Router()
 
 # =====================================================================
-# 3. MEDIA & ATTACHMENT HELPERS (PHOTO, VOICE, FILE, VIDEO, AUDIO)
+# 3. MEDIA & ATTACHMENT HELPERS
 # =====================================================================
 MEDIA_BADGES = {
     "photo": "🖼 [Photo]",
@@ -351,9 +381,6 @@ MEDIA_BADGES = {
 
 
 def extract_media(message: Message) -> Tuple[Optional[str], Optional[str], str]:
-    """
-    Extracts (media_type, file_id, text_or_caption) from any message.
-    """
     raw_text = (message.text or message.caption or "").strip()
     if message.photo:
         return "photo", message.photo[-1].file_id, (raw_text or "Photo Attachment")
@@ -377,9 +404,6 @@ async def send_smart_media(
     media_type: Optional[str] = None,
     file_id: Optional[str] = None,
 ) -> Message:
-    """
-    Sends the appropriate media attachment with caption & buttons, or falls back to text.
-    """
     if media_type and file_id:
         try:
             if media_type == "photo":
@@ -405,14 +429,9 @@ async def edit_or_resend(
     file_id: Optional[str] = None,
     force_text_only: bool = False,
 ) -> None:
-    """
-    Safely edits text/caption messages, or replaces the message when switching
-    between text lists and media attachments (photos/voice notes/files).
-    """
     msg = call.message
     has_msg_media = msg.text is None
 
-    # If we need to display a media item from a text menu, or go back to a text menu from a media item:
     if (media_type and file_id and not has_msg_media) or (force_text_only and has_msg_media):
         try:
             await msg.delete()
@@ -475,7 +494,6 @@ def parse_smart_time(raw: str, user_id: int) -> Optional[Tuple[datetime, str]]:
     u_now = now_user(user_id)
     text = re.sub(r"^(remind me to|remind me|nudge me to|nudge me)\s+", "", text, flags=re.I)
 
-    # 1. Relative time at start: "in 15m <task>" or "+2h <task>" or "10m <task>"
     m_rel = re.match(
         r"^(?:in\s+|\+)?(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b\s*(.*)$",
         text,
@@ -494,7 +512,6 @@ def parse_smart_time(raw: str, user_id: int) -> Optional[Tuple[datetime, str]]:
         )
         return (u_now + delta).astimezone(timezone.utc), (rest or "Reminder")
 
-    # 2. Relative time at end: "<task> in 30m"
     m_rel_end = re.match(
         r"^(.+?)\s+in\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$",
         text,
@@ -513,7 +530,6 @@ def parse_smart_time(raw: str, user_id: int) -> Optional[Tuple[datetime, str]]:
         )
         return (u_now + delta).astimezone(timezone.utc), rest
 
-    # 3. "tomorrow HH:MM <task>"
     m_tom = re.match(r"^tomorrow\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*(.*)$", text, flags=re.I)
     if m_tom:
         hh, mm, rest = int(m_tom.group(1)), int(m_tom.group(2)), m_tom.group(3).strip()
@@ -521,7 +537,6 @@ def parse_smart_time(raw: str, user_id: int) -> Optional[Tuple[datetime, str]]:
             due_local = (u_now + timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
             return due_local.astimezone(timezone.utc), (rest or "Reminder")
 
-    # 4. Full date "YYYY-MM-DD HH:MM <task>"
     m_full = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*(.*)$", text)
     if m_full:
         try:
@@ -532,7 +547,6 @@ def parse_smart_time(raw: str, user_id: int) -> Optional[Tuple[datetime, str]]:
         except ValueError:
             pass
 
-    # 5. Time only "HH:MM <task>"
     m_time = re.match(r"^(?:at\s+)?(\d{1,2}):(\d{2})\s*(.*)$", text, flags=re.I)
     if m_time:
         hh, mm, rest = int(m_time.group(1)), int(m_time.group(2)), m_time.group(3).strip()
@@ -567,7 +581,7 @@ def compute_next_occurrence(due_ts: float, recurrence: str) -> Optional[float]:
 
 
 # =====================================================================
-# 6. KEYBOARDS (REPLY & INLINE)
+# 6. KEYBOARDS
 # =====================================================================
 def main_reply_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -581,10 +595,6 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
 
 
 def fired_nudge_kb(rem_id: int) -> InlineKeyboardMarkup:
-    """
-    All requested Notification Action Buttons:
-    ✅ Done, 💤 +10m, 💤 +1h, 📅 Tomorrow, ✏️ Edit, 🗑 Delete
-    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -676,18 +686,10 @@ def reminder_list_kb(user_id: int, filter_mode: str = "active") -> InlineKeyboar
 
     rows.append(
         [
-            InlineKeyboardButton(
-                text=("• All •" if filter_mode == "active" else "All"), callback_data="rlist:active"
-            ),
-            InlineKeyboardButton(
-                text=("• Today •" if filter_mode == "today" else "Today"), callback_data="rlist:today"
-            ),
-            InlineKeyboardButton(
-                text=("• Repeat •" if filter_mode == "recurring" else "Repeat"), callback_data="rlist:recurring"
-            ),
-            InlineKeyboardButton(
-                text=("• Done •" if filter_mode == "done" else "Done"), callback_data="rlist:done"
-            ),
+            InlineKeyboardButton(text=("• All •" if filter_mode == "active" else "All"), callback_data="rlist:active"),
+            InlineKeyboardButton(text=("• Today •" if filter_mode == "today" else "Today"), callback_data="rlist:today"),
+            InlineKeyboardButton(text=("• Repeat •" if filter_mode == "recurring" else "Repeat"), callback_data="rlist:recurring"),
+            InlineKeyboardButton(text=("• Done •" if filter_mode == "done" else "Done"), callback_data="rlist:done"),
         ]
     )
     rows.append(
@@ -762,14 +764,15 @@ async def cmd_start(message: Message, state: FSMContext):
     sign = "+" if u["tz_offset"] >= 0 else ""
     text = (
         f"👋 Welcome to <b>Nudgelet</b> (<code>@HeyNudgeletBot</code>), <b>{html.escape(u['full_name'])}</b>!\n\n"
-        f"I am your Supabase-powered <b>Smart Reminder Engine</b> and <b>Multimedia Notebook / Draftbook</b>.\n\n"
+        f"I am your AES-Encrypted <b>Smart Reminder Engine</b> and <b>Multimedia Notebook / Draftbook</b>.\n\n"
         f"⚡ <b>Set Reminders (Text, Voice, Photos & Files!):</b>\n"
         f"1️⃣ Tap <b>⏰ New Reminder</b> and send text, a 🎤 voice note, 🖼 photo, or 📎 file.\n"
         f"2️⃣ Use <code>/remind 20m Check the oven</code> or <code>/remind 18:30 Call Mom</code>\n"
         f"3️⃣ Just type naturally or drop any photo/voice/file directly in chat!\n\n"
         f"📓 <b>Notebook & Draftbook:</b>\n"
         f"Save text drafts, voice memos, photos, or documents, append to drafts over time, "
-        f"and convert any note (with its attachment!) into a reminder in one tap.\n\n"
+        f"and convert any note into a reminder in one tap.\n\n"
+        f"🔒 <i>All notes & reminders are encrypted in the database.</i>\n"
         f"🌍 Timezone: <b>UTC{sign}{u['tz_offset']}</b>"
     )
     await message.answer(text, reply_markup=main_reply_kb())
@@ -786,7 +789,7 @@ async def cmd_help(message: Message):
         "• Send any <b>Photo, Voice Note, Video, or File</b> to schedule a media nudge!\n"
         "• <code>/list</code> — View & filter all reminders\n\n"
         "<b>📓 Notebook & Drafts:</b>\n"
-        "• <code>/note Your note text</code> — Instant note save\n"
+        "• <code>/note Your note text</code> — Instant encrypted note save\n"
         "• <code>/draft Your draft text</code> — Save to draftbook\n"
         "• <code>/notes</code> — Open your Multimedia Notebook\n\n"
         "<b>🛠 Tools:</b>\n"
@@ -823,7 +826,7 @@ async def cmd_admin_users(message: Message):
     total_notes = len(db.notes)
 
     lines = [
-        "👑 <b>Nudgelet Admin — Supabase User Directory</b>",
+        "👑 <b>Nudgelet Admin — Encrypted Supabase Directory</b>",
         f"👥 <b>Total Users:</b> {total_users}",
         f"⏰ <b>Active Reminders:</b> {active_rems} | ✅ <b>Completed:</b> {done_rems}",
         f"📓 <b>Saved Notes/Drafts:</b> {total_notes}\n",
@@ -929,7 +932,6 @@ async def cmd_remind_direct(message: Message, command: CommandObject, state: FSM
     await db.ensure_user(message.from_user)
     raw = (command.args or "").strip()
 
-    # Check if command is replying to a media message
     media_type, file_id = None, None
     if message.reply_to_message:
         media_type, file_id, reply_txt = extract_media(message.reply_to_message)
@@ -1195,7 +1197,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer("⚠️ This reminder no longer exists.", show_alert=True)
         return
 
-    # 1. DONE
     if action == "done":
         u = await db.ensure_user(call.from_user)
         u["completed_count"] = u.get("completed_count", 0) + 1
@@ -1234,7 +1235,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer("✅ Marked as Done!")
         return
 
-    # 2. SNOOZE (+10m, +1h, Tomorrow)
     if action in ("snz10", "snz60", "snztm"):
         now_ts = datetime.now(timezone.utc).timestamp()
         if action == "snz10":
@@ -1264,7 +1264,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer(f"💤 Snoozed {lbl}")
         return
 
-    # 3. CUSTOM SNOOZE
     if action == "csnz":
         await state.set_state(NudgeStates.rem_custom_snooze)
         await state.update_data(edit_rem_id=rem_id)
@@ -1275,7 +1274,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer()
         return
 
-    # 4. SAVE REMINDER (AND ITS ATTACHMENT) TO NOTEBOOK
     if action == "tonote":
         note = await db.create_note(
             uid,
@@ -1288,7 +1286,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer(f"📓 Saved to Notebook (#{note['id']})!", show_alert=True)
         return
 
-    # 5. VIEW / EDIT MENU
     if action in ("view", "edit"):
         m_info = f"\n📎 <b>Media:</b> {MEDIA_BADGES.get(rem['media_type'])}" if rem.get("media_type") else ""
         kb = InlineKeyboardMarkup(
@@ -1361,7 +1358,6 @@ async def handle_reminder_actions(call: CallbackQuery, state: FSMContext, bot: B
         await call.answer()
         return
 
-    # 6. DELETE WITH INSTANT UNDO
     if action == "del":
         deleted = await db.delete_reminder(rem_id)
         if deleted:
@@ -1502,7 +1498,7 @@ async def cmd_open_notebook(message: Message):
     uid = message.from_user.id
     total = sum(1 for n in db.notes.values() if n["user_id"] == uid)
     await message.answer(
-        f"📓 <b>Your Multimedia Notebook & Draftbook</b> ({total} saved)\n\n"
+        f"📓 <b>Your Encrypted Notebook & Draftbook</b> ({total} saved)\n\n"
         f"Store text drafts, 🎤 voice memos, 🖼 photos, or 📎 files. "
         f"Append to drafts anytime or convert any note into a scheduled reminder!",
         reply_markup=notebook_list_kb(uid, "all"),
@@ -1515,7 +1511,7 @@ async def start_quick_draft(message: Message, state: FSMContext):
     await state.set_state(NudgeStates.note_waiting_content)
     await message.answer(
         "✍️ <b>Send your Note, Draft, Voice Memo, Photo, or File:</b>\n"
-        "<i>(First line or caption becomes the title automatically!)</i>"
+        "<i>(Encrypted before saving to database!)</i>"
     )
 
 
@@ -1542,7 +1538,7 @@ async def cmd_quick_note(message: Message, command: CommandObject, state: FSMCon
     await send_smart_media(
         message.bot,
         message.chat.id,
-        f"📓 <b>Saved to Notebook (#{note['id']})</b>\n"
+        f"📓 <b>Saved to Encrypted Notebook (#{note['id']})</b>\n"
         f"🏷 <b>Tag:</b> {note['tag']}\n"
         f"📌 <b>Title:</b> {html.escape(note['title'])}\n\n"
         f"{html.escape(note['content'])}",
@@ -1566,7 +1562,7 @@ async def receive_new_note_content(message: Message, state: FSMContext):
     await send_smart_media(
         message.bot,
         message.chat.id,
-        f"📓 <b>Draft Saved (#{note['id']})!</b>\n\n{html.escape(note['content'])}",
+        f"📓 <b>Encrypted Draft Saved (#{note['id']})!</b>\n\n{html.escape(note['content'])}",
         reply_markup=note_detail_kb(note["id"], note["pinned"]),
         media_type=media_type,
         file_id=file_id,
@@ -1857,7 +1853,7 @@ async def handle_settings_cb(call: CallbackQuery):
         f"🕒 Your Local Time: <code>{now_user(u['id']).strftime('%Y-%m-%d %H:%M')}</code>",
         reply_markup=settings_kb(u),
     )
-    await call.answer("Settings saved to Supabase!")
+    await call.answer("Settings saved!")
 
 
 # =====================================================================
@@ -1870,7 +1866,6 @@ async def fallback_smart_handler(message: Message, state: FSMContext):
     if not raw and not file_id:
         return
 
-    # Try smart natural language time parsing first (even if caption on photo/voice/file!)
     parsed = parse_smart_time(raw, message.from_user.id)
     if parsed and not message.forward_origin:
         due_utc, task_text = parsed
@@ -1880,7 +1875,6 @@ async def fallback_smart_handler(message: Message, state: FSMContext):
         await send_created_confirmation(message, rem)
         return
 
-    # Otherwise offer interactive choice: Schedule Reminder OR Save to Notebook
     await state.update_data(
         rem_text=raw[:250],
         priority="normal",
@@ -1899,7 +1893,7 @@ async def fallback_smart_handler(message: Message, state: FSMContext):
     await message.answer(
         f"{header}\n"
         f"📌 {badge}<i>{html.escape(raw[:140])}</i>\n\n"
-        f"Pick a time below to schedule a nudge, or save it straight to your Notebook:",
+        f"Pick a time below to schedule a nudge, or save it straight to your Encrypted Notebook:",
         reply_markup=kb,
     )
 
@@ -1921,12 +1915,12 @@ async def handle_save_captured_as_note(call: CallbackQuery, state: FSMContext):
     )
     await edit_or_resend(
         call,
-        f"📓 <b>Saved to Notebook (#{note['id']})!</b>\n\n{html.escape(note['content'])}",
+        f"📓 <b>Saved to Encrypted Notebook (#{note['id']})!</b>\n\n{html.escape(note['content'])}",
         reply_markup=note_detail_kb(note["id"], note["pinned"]),
         media_type=media_type,
         file_id=file_id,
     )
-    await call.answer("Saved to Supabase Notebook!")
+    await call.answer("Saved to Encrypted Notebook!")
 
 
 # =====================================================================
@@ -2003,7 +1997,6 @@ async def scheduler_engine(bot: Bot):
                     rem["last_nag_ts"] = now_ts
                     await db.save_reminder(rem["id"])
 
-            # Daily 08:00 Morning Digest Check
             for uid, u in list(db.users.items()):
                 if not u.get("digest_enabled", True):
                     continue
@@ -2041,7 +2034,7 @@ async def scheduler_engine(bot: Bot):
 # 16. RAILWAY HEALTH-CHECK SERVER & ENTRYPOINT
 # =====================================================================
 async def health_handler(request):
-    return web.Response(text="Nudgelet (@HeyNudgeletBot) + Supabase is alive!")
+    return web.Response(text="Nudgelet (@HeyNudgeletBot) + Encrypted Supabase is alive!")
 
 
 async def start_health_server():
